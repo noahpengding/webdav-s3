@@ -15,6 +15,7 @@ build:
     - docker push $IMAGE_NAME:$VERSION
   tags:
     - docker
+    - homelab
   only:
     variables:
       - $CI_COMMIT_BRANCH == "main"
