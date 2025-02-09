@@ -13,9 +13,9 @@ build:
     - docker tag $IMAGE_NAME:$VERSION $IMAGE_NAME:latest
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
     - docker push $IMAGE_NAME:$VERSION
+    - docker push $IMAGE_NAME:latest
   tags:
     - docker
-    - homelab
   only:
     variables:
       - $CI_COMMIT_BRANCH == "main"
