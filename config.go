@@ -15,6 +15,8 @@ type Config struct {
 
 	Port    string
 	BaseURL string
+
+	PprofAddr string
 }
 
 func LoadConfig() *Config {
@@ -25,8 +27,9 @@ func LoadConfig() *Config {
 		BucketName: os.Getenv("bucket_name"),
 		Region:     os.Getenv("region"),
 		Endpoint:   os.Getenv("endpoint"),
-		Port:       os.Getenv("port"),
+		Port:       getEnv("port", "8080"),
 		BaseURL:    os.Getenv("baseurl"),
+		PprofAddr:  getEnv("pprof_addr", ""),
 	}
 
 	Logoutput("Using Environment Variables", "info_force")

@@ -1,0 +1,15 @@
+.git
+.github
+.agents
+.codex
+.env
+.env.*
+test.env
+docker-compose_test.yml
+webdav
+webdav.exe
+*.test
+*.out
+*.log
+*.tmp
+conf/

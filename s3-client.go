@@ -49,7 +49,7 @@ func NewS3Client() *S3Client {
 			o.BaseEndpoint = aws.String(Cfg.Endpoint)
 		}
 	})
-	s3conf := "AccessKey: " + Cfg.AccessKey + "\nSecretKey: " + Cfg.SecretKey + "\nBucketName: " + Cfg.BucketName + "\nRegion: " + Cfg.Region + "\nEndpoint: " + Cfg.Endpoint
+	s3conf := "AccessKey: " + maskSecret(Cfg.AccessKey) + "\nSecretKey: " + maskSecret(Cfg.SecretKey) + "\nBucketName: " + Cfg.BucketName + "\nRegion: " + Cfg.Region + "\nEndpoint: " + Cfg.Endpoint
 	if _, err := s3Client.ListBuckets(ctx, &s3.ListBucketsInput{}); err != nil {
 		Logoutput("Cannot Create S3 Client, Please check the S3 configuration;\nCurrent configuration: "+s3conf+"\n Error:"+err.Error(), "error")
 		return nil
@@ -83,6 +83,17 @@ func trimConfigValue(value string) string {
 	return strings.TrimSpace(value)
 }
 
+func maskSecret(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if len(value) <= 8 {
+		return "****"
+	}
+	return value[:4] + "****" + value[len(value)-4:]
+}
+
 func isValidS3Region(region string) bool {
 	for _, label := range strings.Split(region, ".") {
 		if len(label) == 0 || len(label) > 63 {
@@ -102,39 +113,53 @@ func isValidS3Region(region string) bool {
 	return true
 }
 
-func (s *S3Client) ListObjects(key string) (*s3.ListObjectsV2Output, error) {
+func (s *S3Client) ListObjects(ctx context.Context, key string) (*s3.ListObjectsV2Output, error) {
 	Logoutput("ListObjects: "+key, "debug")
 	input := &s3.ListObjectsV2Input{
 		Bucket:    aws.String(Cfg.BucketName),
 		Prefix:    aws.String(key),
 		Delimiter: aws.String("/"),
 	}
-	return s.Client.ListObjectsV2(context.Background(), input)
+	paginator := s3.NewListObjectsV2Paginator(s.Client, input)
+	output := &s3.ListObjectsV2Output{}
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		output.CommonPrefixes = append(output.CommonPrefixes, page.CommonPrefixes...)
+		output.Contents = append(output.Contents, page.Contents...)
+		output.Delimiter = page.Delimiter
+		output.EncodingType = page.EncodingType
+		output.Name = page.Name
+		output.Prefix = page.Prefix
+	}
+	return output, nil
 }
 
-func (s *S3Client) GetObject(key string) (*s3.GetObjectOutput, error) {
+func (s *S3Client) GetObject(ctx context.Context, key string) (*s3.GetObjectOutput, error) {
 	Logoutput("GetObject: "+key, "debug")
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(Cfg.BucketName),
 		Key:    aws.String(key),
 	}
-	return s.Client.GetObject(context.Background(), input)
+	return s.Client.GetObject(ctx, input)
 }
 
-func (s *S3Client) GetObjectWithFallback(key, fallbackKey string) (*s3.GetObjectOutput, string, error) {
-	result, err := s.GetObject(key)
+func (s *S3Client) GetObjectWithFallback(ctx context.Context, key, fallbackKey string) (*s3.GetObjectOutput, string, error) {
+	result, err := s.GetObject(ctx, key)
 	if err == nil || fallbackKey == "" || fallbackKey == key || !isS3NotFound(err) {
 		return result, key, err
 	}
 
-	result, fallbackErr := s.GetObject(fallbackKey)
+	result, fallbackErr := s.GetObject(ctx, fallbackKey)
 	if fallbackErr != nil {
 		return nil, key, err
 	}
 	return result, fallbackKey, nil
 }
 
-func (s *S3Client) PutObject(key string, body io.Reader, providedContentType string) (*s3.PutObjectOutput, error) {
+func (s *S3Client) PutObject(ctx context.Context, key string, body io.Reader, providedContentType string) (*s3.PutObjectOutput, error) {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		Logoutput("Unable to read Body for Put Requests", "info")
@@ -151,41 +176,41 @@ func (s *S3Client) PutObject(key string, body io.Reader, providedContentType str
 	if isImageContentType(contentType) {
 		input.ContentDisposition = aws.String("inline")
 	}
-	return s.Client.PutObject(context.Background(), input)
+	return s.Client.PutObject(ctx, input)
 }
 
-func (s *S3Client) DeleteObject(key string) (*s3.DeleteObjectOutput, error) {
+func (s *S3Client) DeleteObject(ctx context.Context, key string) (*s3.DeleteObjectOutput, error) {
 	Logoutput("DeleteObject: "+key, "debug")
 	input := &s3.DeleteObjectInput{
 		Bucket: aws.String(Cfg.BucketName),
 		Key:    aws.String(key),
 	}
-	return s.Client.DeleteObject(context.Background(), input)
+	return s.Client.DeleteObject(ctx, input)
 }
 
-func (s *S3Client) CopyObject(src, dest string) (*s3.CopyObjectOutput, error) {
+func (s *S3Client) CopyObject(ctx context.Context, src, dest string) (*s3.CopyObjectOutput, error) {
 	Logoutput("CopyObject: "+src+" to "+dest, "debug")
 	input := &s3.CopyObjectInput{
 		Bucket:     aws.String(Cfg.BucketName),
 		CopySource: aws.String(Cfg.BucketName + "/" + src),
 		Key:        aws.String(dest),
 	}
-	return s.Client.CopyObject(context.Background(), input)
+	return s.Client.CopyObject(ctx, input)
 }
 
-func (s *S3Client) MoveObject(src, dest string) (*s3.CopyObjectOutput, error) {
+func (s *S3Client) MoveObject(ctx context.Context, src, dest string) (*s3.CopyObjectOutput, error) {
 	Logoutput("MoveObject: "+src+" to "+dest, "debug")
-	_, err := s.CopyObject(src, dest)
+	result, err := s.CopyObject(ctx, src, dest)
 	if err != nil {
 		Logoutput("Unable to copy object From Move Requsts", "info")
 		return nil, err
 	}
-	_, err = s.DeleteObject(src)
+	_, err = s.DeleteObject(ctx, src)
 	if err != nil {
 		Logoutput("Unable to delete object From Move Requets", "info")
 		return nil, err
 	}
-	return nil, nil
+	return result, nil
 }
 
 func isS3NotFound(err error) bool {

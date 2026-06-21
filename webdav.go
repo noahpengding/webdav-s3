@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/xml"
+	htmlpkg "html"
 	"io"
 	"mime"
 	"net/http"
@@ -58,7 +60,7 @@ func (h *WebDAVClient) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *WebDAVClient) Get(w http.ResponseWriter, r *http.Request) {
 	key := objectKeyFromPath(r.URL.Path)
-	result, actualKey, err := h.Backend.GetObjectWithFallback(key, r.URL.Path)
+	result, actualKey, err := h.Backend.GetObjectWithFallback(r.Context(), key, r.URL.Path)
 	if err != nil {
 		Logoutput("Unable to Get object From Get Requests: "+key, "info")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -88,7 +90,7 @@ func (h *WebDAVClient) Get_html(w http.ResponseWriter, r *http.Request) {
 		keyPrefix += "/"
 	}
 	Logoutput("Get_html: "+keyPrefix, "debug")
-	result, err := h.Backend.ListObjects(keyPrefix)
+	result, err := h.Backend.ListObjects(r.Context(), keyPrefix)
 	if err != nil {
 		Logoutput("Unable to List object From Get_html Requests: "+keyPrefix, "info")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -97,10 +99,11 @@ func (h *WebDAVClient) Get_html(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html;charset=utf-8")
 	displayPath := canonicalURLPath(r.URL.Path)
+	escapedDisplayPath := htmlpkg.EscapeString(displayPath)
 	html := `
 	<html>
 	<head>
-		<title>Index of ` + displayPath + `</title>
+		<title>Index of ` + escapedDisplayPath + `</title>
 		<style>
 			th, td { text-align: left; padding: 0.5em; }
 			th { border-bottom: 1px solid #eee; }
@@ -115,7 +118,7 @@ func (h *WebDAVClient) Get_html(w http.ResponseWriter, r *http.Request) {
 		</style>
 	</head>
 	<body>
-		<h1>Index of ` + displayPath + `</h1>
+		<h1>Index of ` + escapedDisplayPath + `</h1>
 		<table>
 			<tr><th>Name</th><th>Last Modified</th><th>Size</th></tr>`
 
@@ -123,19 +126,18 @@ func (h *WebDAVClient) Get_html(w http.ResponseWriter, r *http.Request) {
 	if keyPrefix == "/" {
 		parentpath = ""
 	}
-	html += `<tr><td><a href="` + parentpath + "/" + `">../</a></td><td>-</td><td>-</td></tr>`
+	html += `<tr><td><a href="` + htmlAttribute(parentpath+"/") + `">../</a></td><td>-</td><td>-</td></tr>`
 
 	for _, prefix := range result.CommonPrefixes {
 		prefixKey := stringValue(prefix.Prefix)
-		html += `<tr><td><a href="` + assetPathFromKey(prefixKey) + `">` + prefixKey + `</a></td><td>-</td><td>-</td></tr>`
+		html += `<tr><td><a href="` + htmlAttribute(assetPathFromKey(prefixKey)) + `">` + htmlpkg.EscapeString(prefixKey) + `</a></td><td>-</td><td>-</td></tr>`
 	}
 	for _, obj := range result.Contents {
 		objKey := stringValue(obj.Key)
 		href := assetPathFromKey(objKey)
-		modified := timeValue(obj.LastModified).String()
-		modified = strings.Split(modified, ".")[0]
+		modified := formatHTTPTime(obj.LastModified)
 		size := formatByte(int64Value(obj.Size))
-		html += `<tr><td><a href="` + href + `">` + objKey + `</a></td><td>` + modified + `</td><td>` + size + `</td></tr>`
+		html += `<tr><td><a href="` + htmlAttribute(href) + `">` + htmlpkg.EscapeString(objKey) + `</a></td><td>` + htmlpkg.EscapeString(modified) + `</td><td>` + htmlpkg.EscapeString(size) + `</td></tr>`
 	}
 
 	html += `</table></body></html>`
@@ -150,7 +152,7 @@ func (h *WebDAVClient) Propfind(w http.ResponseWriter, r *http.Request) {
 		keyPrefix += "/"
 	}
 	Logoutput("Propfind: "+keyPrefix, "debug")
-	result, err := h.Backend.ListObjects(keyPrefix)
+	result, err := h.Backend.ListObjects(r.Context(), keyPrefix)
 	if err != nil {
 		Logoutput("Unable to List object From Propfind Requests: "+keyPrefix, "info")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -164,16 +166,16 @@ func (h *WebDAVClient) Propfind(w http.ResponseWriter, r *http.Request) {
 	<?xml version="1.0" encoding="utf-8" ?>
 	<d:multistatus xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">
 		<d:response>
-			<d:href>` + canonicalURLPath(r.URL.Path) + `</d:href>`
+			<d:href>` + xmlText(canonicalURLPath(r.URL.Path)) + `</d:href>`
 
 	for _, prefix := range result.CommonPrefixes {
 		prefixKey := stringValue(prefix.Prefix)
 		xmlResponse += `
 		<d:response>
-			<d:href>` + assetPathFromKey(prefixKey) + `</d:href>
+			<d:href>` + xmlText(assetPathFromKey(prefixKey)) + `</d:href>
 			<d:propstat>
 				<d:prop>
-					<d:displayname>` + prefixKey + `</d:displayname>
+					<d:displayname>` + xmlText(prefixKey) + `</d:displayname>
 					<d:resourcetype><d:collection/></d:resourcetype>
 				</d:prop>
 				<d:status>HTTP/1.1 200 OK</d:status>
@@ -182,17 +184,16 @@ func (h *WebDAVClient) Propfind(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, obj := range result.Contents {
 		objKey := stringValue(obj.Key)
-		modified := timeValue(obj.LastModified).String()
-		modified = strings.Split(modified, ".")[0]
-		size := formatByte(int64Value(obj.Size))
+		modified := formatHTTPTime(obj.LastModified)
+		size := strconv.FormatInt(int64Value(obj.Size), 10)
 		xmlResponse += `
 		<d:response>
-			<d:href>` + assetPathFromKey(objKey) + `</d:href>
+			<d:href>` + xmlText(assetPathFromKey(objKey)) + `</d:href>
 			<d:propstat>
 				<d:prop>
-					<d:displayname>` + path.Base(objKey) + `</d:displayname>
-					<d:getlastmodified>` + modified + `</d:getlastmodified>
-					<d:getcontentlength>` + size + `</d:getcontentlength>
+					<d:displayname>` + xmlText(path.Base(objKey)) + `</d:displayname>
+					<d:getlastmodified>` + xmlText(modified) + `</d:getlastmodified>
+					<d:getcontentlength>` + xmlText(size) + `</d:getcontentlength>
 				</d:prop>
 				<d:status>HTTP/1.1 200 OK</d:status>
 			</d:propstat>
@@ -228,7 +229,7 @@ func formatByte(size int64) string {
 func (h *WebDAVClient) Put(w http.ResponseWriter, r *http.Request) {
 	key := objectKeyFromPath(r.URL.Path)
 	Logoutput("Put: "+key, "debug")
-	_, err := h.Backend.PutObject(key, r.Body, r.Header.Get("Content-Type"))
+	_, err := h.Backend.PutObject(r.Context(), key, r.Body, r.Header.Get("Content-Type"))
 	if err != nil {
 		Logoutput("Unable to Put object From Put Requests: "+key, "info")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -240,7 +241,7 @@ func (h *WebDAVClient) Put(w http.ResponseWriter, r *http.Request) {
 func (h *WebDAVClient) Delete(w http.ResponseWriter, r *http.Request) {
 	key := objectKeyFromPath(r.URL.Path)
 	Logoutput("Delete: "+key, "debug")
-	_, err := h.Backend.DeleteObject(key)
+	_, err := h.Backend.DeleteObject(r.Context(), key)
 	if err != nil {
 		Logoutput("Unable to Delete object From Delete Requests: "+key, "info")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -259,7 +260,7 @@ func (h *WebDAVClient) Copy(w http.ResponseWriter, r *http.Request) {
 	}
 	dest = objectKeyFromDestination(dest)
 	Logoutput("Copy: "+src+" to "+dest, "debug")
-	_, err := h.Backend.CopyObject(src, dest)
+	_, err := h.Backend.CopyObject(r.Context(), src, dest)
 	if err != nil {
 		Logoutput("Unable to Copy object From Copy Requests: "+src+" to "+dest, "info")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -278,7 +279,7 @@ func (h *WebDAVClient) Move(w http.ResponseWriter, r *http.Request) {
 	}
 	dest = objectKeyFromDestination(dest)
 	Logoutput("Move: "+src+" to "+dest, "debug")
-	_, err := h.Backend.MoveObject(src, dest)
+	_, err := h.Backend.MoveObject(r.Context(), src, dest)
 	if err != nil {
 		Logoutput("Unable to Move object From Move Requests: "+src+" to "+dest, "info")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -293,7 +294,7 @@ func (h *WebDAVClient) Mkcol(w http.ResponseWriter, r *http.Request) {
 		key += "/"
 	}
 	Logoutput("Mkcol: "+key, "debug")
-	_, err := h.Backend.PutObject(key, strings.NewReader(""), "")
+	_, err := h.Backend.PutObject(r.Context(), key, strings.NewReader(""), "")
 	if err != nil {
 		Logoutput("Unable to Put object From Mkcol Requests: "+key, "info")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -314,7 +315,7 @@ func (h *WebDAVClient) Option(w http.ResponseWriter, r *http.Request) {
 func (h *WebDAVClient) Head(w http.ResponseWriter, r *http.Request) {
 	key := objectKeyFromPath(r.URL.Path)
 	Logoutput("Head: "+key, "debug")
-	result, actualKey, err := h.Backend.GetObjectWithFallback(key, r.URL.Path)
+	result, actualKey, err := h.Backend.GetObjectWithFallback(r.Context(), key, r.URL.Path)
 	if err != nil {
 		Logoutput("Unable to Get object From Head Requests: "+key, "info")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -467,9 +468,21 @@ func int64Value(value *int64) int64 {
 	return *value
 }
 
-func timeValue(value *time.Time) time.Time {
-	if value == nil {
-		return time.Time{}
+func formatHTTPTime(value *time.Time) string {
+	if value == nil || value.IsZero() {
+		return ""
 	}
-	return *value
+	return value.UTC().Format(http.TimeFormat)
+}
+
+func htmlAttribute(value string) string {
+	return htmlpkg.EscapeString(value)
+}
+
+func xmlText(value string) string {
+	var buffer bytes.Buffer
+	if err := xml.EscapeText(&buffer, []byte(value)); err != nil {
+		return ""
+	}
+	return buffer.String()
 }

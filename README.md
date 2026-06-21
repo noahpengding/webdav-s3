@@ -1,6 +1,6 @@
 # WebDAV Server with AWS S3 Backend
 
-A lightweight GO WebDAV server that uses AWS S3 as a backend. It uses AWS SDK for Go to interact with S3, which means no storage is required on the server itself. Configuration is provided through environment variables.
+A lightweight Go WebDAV server that uses AWS S3 as a backend. It uses AWS SDK for Go v2 to interact with S3, which means no storage is required on the server itself. Configuration is provided through environment variables.
 
 
 ## Installing
@@ -24,6 +24,8 @@ export bucket_name=webdav
 export endpoint=https://s3.us-east-1.amazonaws.com
 export baseurl=http://127.0.0.1
 export port=8080
+# Optional: expose net/http/pprof on a private address for debugging.
+# export pprof_addr=127.0.0.1:6060
 ```
 3. Run the server:
 ```bash
@@ -46,6 +48,8 @@ services:
         - endpoint=https://s3.us-east-1.amazonaws.com
         - baseurl=http://127.0.0.1
         - port=8080
+        # Optional: expose net/http/pprof on a private address for debugging.
+        # - pprof_addr=127.0.0.1:6060
     ports:
         - 8080:8080
 ```
@@ -95,6 +99,7 @@ This project is licensed under the MIT License - see the LICENSE.md file for det
 - [x] GET, PUT, DELETE, MKCOL, COPY, MOVE, OPTIONS, PROPFIND, Head Methods
 - [ ] Inside Basic AUTH
 - [X] Use Environment Variables for Configuration
-- [ ] Upgrade AWS-SDK to AWS Go SDK v2 for large file upload & download
-- [ ] GitHub Actions for CI/CD
+- [X] Upgrade AWS-SDK to AWS Go SDK v2
+- [X] GitHub Actions for CI/CD
 - [X] Better Logging and Error Handling
+- [ ] Stream large uploads instead of buffering complete request bodies
