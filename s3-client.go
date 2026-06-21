@@ -2,39 +2,43 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"mime"
 	"net/http"
 	"path/filepath"
 	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 )
 
 type S3Client struct {
-	Client *s3.S3
+	Client *s3.Client
 }
 
 func NewS3Client() *S3Client {
-	awsConfig := &aws.Config{
-		Region:      aws.String(Cfg.Region),
-		Endpoint:    aws.String(Cfg.Endpoint),
-		Credentials: credentials.NewStaticCredentials(Cfg.AccessKey, Cfg.SecretKey, ""),
-	}
-	awsConfig.S3ForcePathStyle = aws.Bool(true)
-
-	sess, err := session.NewSession(awsConfig)
+	ctx := context.Background()
+	awsConfig, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(Cfg.Region),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(Cfg.AccessKey, Cfg.SecretKey, "")),
+	)
 	if err != nil {
-		Logoutput("Unable to create S3 session", "error")
+		Logoutput("Unable to load AWS configuration", "error")
 		return nil
 	}
-	s3Client := s3.New(sess)
+	s3Client := s3.NewFromConfig(awsConfig, func(o *s3.Options) {
+		o.UsePathStyle = true
+		if Cfg.Endpoint != "" {
+			o.BaseEndpoint = aws.String(Cfg.Endpoint)
+		}
+	})
 	s3conf := "AccessKey: " + Cfg.AccessKey + "\nSecretKey: " + Cfg.SecretKey + "\nBucketName: " + Cfg.BucketName + "\nRegion: " + Cfg.Region + "\nEndpoint: " + Cfg.Endpoint
-	if _, err := s3Client.ListBuckets(nil); err != nil {
+	if _, err := s3Client.ListBuckets(ctx, &s3.ListBucketsInput{}); err != nil {
 		Logoutput("Cannot Create S3 Client, Please check the S3 configuration;\nCurrent configuration: "+s3conf+"\n Error:"+err.Error(), "error")
 		return nil
 	}
@@ -51,7 +55,7 @@ func (s *S3Client) ListObjects(key string) (*s3.ListObjectsV2Output, error) {
 		Prefix:    aws.String(key),
 		Delimiter: aws.String("/"),
 	}
-	return s.Client.ListObjectsV2(input)
+	return s.Client.ListObjectsV2(context.Background(), input)
 }
 
 func (s *S3Client) GetObject(key string) (*s3.GetObjectOutput, error) {
@@ -60,7 +64,7 @@ func (s *S3Client) GetObject(key string) (*s3.GetObjectOutput, error) {
 		Bucket: aws.String(Cfg.BucketName),
 		Key:    aws.String(key),
 	}
-	return s.Client.GetObject(input)
+	return s.Client.GetObject(context.Background(), input)
 }
 
 func (s *S3Client) GetObjectWithFallback(key, fallbackKey string) (*s3.GetObjectOutput, string, error) {
@@ -93,7 +97,7 @@ func (s *S3Client) PutObject(key string, body io.Reader, providedContentType str
 	if isImageContentType(contentType) {
 		input.ContentDisposition = aws.String("inline")
 	}
-	return s.Client.PutObject(input)
+	return s.Client.PutObject(context.Background(), input)
 }
 
 func (s *S3Client) DeleteObject(key string) (*s3.DeleteObjectOutput, error) {
@@ -102,7 +106,7 @@ func (s *S3Client) DeleteObject(key string) (*s3.DeleteObjectOutput, error) {
 		Bucket: aws.String(Cfg.BucketName),
 		Key:    aws.String(key),
 	}
-	return s.Client.DeleteObject(input)
+	return s.Client.DeleteObject(context.Background(), input)
 }
 
 func (s *S3Client) CopyObject(src, dest string) (*s3.CopyObjectOutput, error) {
@@ -112,7 +116,7 @@ func (s *S3Client) CopyObject(src, dest string) (*s3.CopyObjectOutput, error) {
 		CopySource: aws.String(Cfg.BucketName + "/" + src),
 		Key:        aws.String(dest),
 	}
-	return s.Client.CopyObject(input)
+	return s.Client.CopyObject(context.Background(), input)
 }
 
 func (s *S3Client) MoveObject(src, dest string) (*s3.CopyObjectOutput, error) {
@@ -134,9 +138,10 @@ func isS3NotFound(err error) bool {
 	if err == nil {
 		return false
 	}
-	if awsErr, ok := err.(awserr.Error); ok {
-		switch awsErr.Code() {
-		case s3.ErrCodeNoSuchKey, "NotFound":
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NoSuchKey", "NotFound":
 			return true
 		}
 	}
