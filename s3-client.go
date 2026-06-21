@@ -23,8 +23,20 @@ type S3Client struct {
 
 func NewS3Client() *S3Client {
 	ctx := context.Background()
+	region, endpoint := normalizeS3Config(Cfg.Region, Cfg.Endpoint)
+	if region == "" {
+		Logoutput("S3 region is required", "error")
+		return nil
+	}
+	if !isValidS3Region(region) {
+		Logoutput("Invalid S3 region "+region+". AWS SDK Go v2 requires the region to be a valid host label. For custom S3 endpoints, use a signing region such as us-east-1 and put the service URL in endpoint.", "error")
+		return nil
+	}
+	Cfg.Region = region
+	Cfg.Endpoint = endpoint
+
 	awsConfig, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion(Cfg.Region),
+		config.WithRegion(region),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(Cfg.AccessKey, Cfg.SecretKey, "")),
 	)
 	if err != nil {
@@ -46,6 +58,48 @@ func NewS3Client() *S3Client {
 	return &S3Client{
 		Client: s3Client,
 	}
+}
+
+func normalizeS3Config(region, endpoint string) (string, string) {
+	region = trimConfigValue(region)
+	endpoint = trimConfigValue(endpoint)
+	if region == "" && endpoint != "" {
+		region = "us-east-1"
+	}
+	if endpoint != "" && !strings.Contains(endpoint, "://") {
+		endpoint = "https://" + endpoint
+	}
+	return region, endpoint
+}
+
+func trimConfigValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 {
+		quote := value[0]
+		if (quote == '"' || quote == '\'') && value[len(value)-1] == quote {
+			value = value[1 : len(value)-1]
+		}
+	}
+	return strings.TrimSpace(value)
+}
+
+func isValidS3Region(region string) bool {
+	for _, label := range strings.Split(region, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		for _, r := range label {
+			switch {
+			case r >= '0' && r <= '9':
+			case r >= 'A' && r <= 'Z':
+			case r >= 'a' && r <= 'z':
+			case r == '-':
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (s *S3Client) ListObjects(key string) (*s3.ListObjectsV2Output, error) {
