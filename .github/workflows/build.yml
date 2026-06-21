@@ -31,9 +31,9 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64
-          push: false
-          load: false
+          platforms: linux/amd64, linux/arm64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:pr-${{ github.event.pull_request.number }}
 
   docker-release:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
