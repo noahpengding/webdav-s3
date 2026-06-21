@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type WebDAVClient struct {
@@ -20,6 +24,9 @@ func NewWebDAVClient() *WebDAVClient {
 
 func (h *WebDAVClient) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	Logoutput(r.Method+" "+r.URL.Path, "debug")
+	if (r.Method == "GET" || r.Method == "HEAD") && redirectCanonicalPath(w, r) {
+		return
+	}
 	switch r.Method {
 		case "GET":
 			if r.URL.Path != "" && strings.HasSuffix(r.URL.Path, "/") {
@@ -50,8 +57,8 @@ func (h *WebDAVClient) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *WebDAVClient) Get(w http.ResponseWriter, r *http.Request) {
-	key := r.URL.Path
-	result, err := h.Backend.GetObject(key)
+	key := objectKeyFromPath(r.URL.Path)
+	result, actualKey, err := h.Backend.GetObjectWithFallback(key, r.URL.Path)
 	if err != nil {
 		Logoutput("Unable to Get object From Get Requests: "+key, "info")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -59,13 +66,15 @@ func (h *WebDAVClient) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	defer result.Body.Close()
 
-	for k, v := range result.Metadata {
-		Logoutput(k+" : "+*v, "debug")
-		w.Header().Set(k, *v)
+	prefix, err := readContentPrefix(result.Body)
+	if err != nil {
+		Logoutput("Unable to read object prefix From Get Requests: "+key, "info")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	w.Header().Set("Content-Type", "application/octet-stream")
+	setObjectResponseHeaders(w, actualKey, result.Metadata, result.ContentType, result.ContentDisposition, result.CacheControl, result.ContentEncoding, result.ContentLanguage, result.ETag, result.LastModified, result.Expires, result.ContentLength, prefix)
 
-	_, err = io.Copy(w, result.Body)
+	_, err = io.Copy(w, io.MultiReader(bytes.NewReader(prefix), result.Body))
 	if err != nil {
 		Logoutput("Unable to io.copy object From Get Requests: "+key, "info")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -74,7 +83,7 @@ func (h *WebDAVClient) Get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *WebDAVClient) Get_html(w http.ResponseWriter, r *http.Request){
-	keyPrefix := r.URL.Path[1:]
+	keyPrefix := objectKeyFromPath(r.URL.Path)
 	if keyPrefix != "" && !strings.HasSuffix(keyPrefix, "/") {
         keyPrefix += "/"
     }
@@ -87,10 +96,11 @@ func (h *WebDAVClient) Get_html(w http.ResponseWriter, r *http.Request){
 	}
 
 	w.Header().Set("Content-Type", "text/html;charset=utf-8")
+	displayPath := canonicalURLPath(r.URL.Path)
 	html := `
 	<html>
 	<head>
-		<title>Index of ` + r.URL.Path + `</title>
+		<title>Index of ` + displayPath + `</title>
 		<style>
 			th, td { text-align: left; padding: 0.5em; }
 			th { border-bottom: 1px solid #eee; }
@@ -105,10 +115,10 @@ func (h *WebDAVClient) Get_html(w http.ResponseWriter, r *http.Request){
 		</style>
 	</head>
 	<body>
-		<h1>Index of ` + r.URL.Path + `</h1>
+		<h1>Index of ` + displayPath + `</h1>
 		<table>
 			<tr><th>Name</th><th>Last Modified</th><th>Size</th></tr>`
-	
+
 	parentpath := strings.Join(strings.Split(r.URL.Path, "/")[0:len(strings.Split(r.URL.Path, "/"))-2], "/")
 	if keyPrefix == "/"{
 		parentpath = ""
@@ -116,10 +126,10 @@ func (h *WebDAVClient) Get_html(w http.ResponseWriter, r *http.Request){
 	html += `<tr><td><a href="` + parentpath + "/" + `">../</a></td><td>-</td><td>-</td></tr>`
 
 	for _, prefix := range result.CommonPrefixes {
-		html += `<tr><td><a href="` + "/" + *prefix.Prefix + `">` + *prefix.Prefix + `</a></td><td>-</td><td>-</td></tr>`
+		html += `<tr><td><a href="` + assetPathFromKey(*prefix.Prefix) + `">` + *prefix.Prefix + `</a></td><td>-</td><td>-</td></tr>`
 	}
 	for _, obj := range result.Contents {
-		href := path.Join("/", *obj.Key)
+		href := assetPathFromKey(*obj.Key)
 		modified := obj.LastModified.String()
 		modified = strings.Split(modified, ".")[0]
 		size := formatByte(*obj.Size)
@@ -133,7 +143,7 @@ func (h *WebDAVClient) Get_html(w http.ResponseWriter, r *http.Request){
 }
 
 func (h *WebDAVClient) Propfind(w http.ResponseWriter, r *http.Request) {
-	keyPrefix := r.URL.Path[1:]
+	keyPrefix := objectKeyFromPath(r.URL.Path)
 	if keyPrefix != "" && !strings.HasSuffix(keyPrefix, "/") {
         keyPrefix += "/"
     }
@@ -145,20 +155,19 @@ func (h *WebDAVClient) Propfind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusMultiStatus)
 	w.Header().Set("Content-Type", "text/xml;charset=utf-8")
 	w.Header().Set("Connection", "keep-alive")
-	
+
 	xmlResponse := `
 	<?xml version="1.0" encoding="utf-8" ?>
 	<d:multistatus xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">
 		<d:response>
-			<d:href>` + r.URL.Path + `</d:href>`
+			<d:href>` + canonicalURLPath(r.URL.Path) + `</d:href>`
 
 	for _, prefix := range result.CommonPrefixes {
 		xmlResponse += `
 		<d:response>
-			<d:href>/` + *prefix.Prefix + `</d:href>
+			<d:href>` + assetPathFromKey(*prefix.Prefix) + `</d:href>
 			<d:propstat>
 				<d:prop>
 					<d:displayname>` + *prefix.Prefix + `</d:displayname>
@@ -174,7 +183,7 @@ func (h *WebDAVClient) Propfind(w http.ResponseWriter, r *http.Request) {
 		size := formatByte(*obj.Size)
 		xmlResponse += `
 		<d:response>
-			<d:href>` + *obj.Key + `</d:href>
+			<d:href>` + assetPathFromKey(*obj.Key) + `</d:href>
 			<d:propstat>
 				<d:prop>
 					<d:displayname>` + path.Base(*obj.Key) + `</d:displayname>
@@ -192,7 +201,7 @@ func (h *WebDAVClient) Propfind(w http.ResponseWriter, r *http.Request) {
 	xmlResponse = strings.Replace(xmlResponse, "\n", "", -1)
 	xmlResponse = strings.Replace(xmlResponse, "  ", "", -1)
 	Logoutput("XML: "+xmlResponse, "debug")
-    w.WriteHeader(http.StatusOK)
+    w.WriteHeader(http.StatusMultiStatus)
     w.Write([]byte(xmlResponse))
 }
 
@@ -213,9 +222,9 @@ func formatByte (size int64) string {
 }
 
 func (h *WebDAVClient) Put(w http.ResponseWriter, r *http.Request) {
-	key := r.URL.Path
+	key := objectKeyFromPath(r.URL.Path)
 	Logoutput("Put: "+key, "debug")
-	_, err := h.Backend.PutObject(key, r.Body)
+	_, err := h.Backend.PutObject(key, r.Body, r.Header.Get("Content-Type"))
 	if err != nil {
 		Logoutput("Unable to Put object From Put Requests: "+key, "info")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -225,7 +234,7 @@ func (h *WebDAVClient) Put(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *WebDAVClient) Delete(w http.ResponseWriter, r *http.Request) {
-	key := r.URL.Path
+	key := objectKeyFromPath(r.URL.Path)
 	Logoutput("Delete: "+key, "debug")
 	_, err := h.Backend.DeleteObject(key)
 	if err != nil {
@@ -237,16 +246,14 @@ func (h *WebDAVClient) Delete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *WebDAVClient) Copy(w http.ResponseWriter, r *http.Request) {
-	src := r.URL.Path[1:]
+	src := objectKeyFromPath(r.URL.Path)
 	dest := r.Header.Get("Destination")
 	if dest == "" {
 		Logoutput("Destination header is required", "info")
 		http.Error(w, "Destination header is required", http.StatusBadRequest)
 		return
 	}
-	if strings.HasPrefix(dest, "/") {
-		dest = dest[1:]
-	}
+	dest = objectKeyFromDestination(dest)
 	Logoutput("Copy: "+src+" to "+dest, "debug")
 	_, err := h.Backend.CopyObject(src, dest)
 	if err != nil {
@@ -258,16 +265,14 @@ func (h *WebDAVClient) Copy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *WebDAVClient) Move(w http.ResponseWriter, r *http.Request) {
-	src := r.URL.Path[1:]
+	src := objectKeyFromPath(r.URL.Path)
 	dest := r.Header.Get("Destination")
 	if dest == "" {
 		Logoutput("Destination header is required", "info")
 		http.Error(w, "Destination header is required", http.StatusBadRequest)
 		return
 	}
-	if strings.HasPrefix(dest, "/") {
-		dest = dest[1:]
-	}
+	dest = objectKeyFromDestination(dest)
 	Logoutput("Move: "+src+" to "+dest, "debug")
 	_, err := h.Backend.MoveObject(src, dest)
 	if err != nil {
@@ -279,12 +284,12 @@ func (h *WebDAVClient) Move(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *WebDAVClient) Mkcol(w http.ResponseWriter, r *http.Request) {
-	key := r.URL.Path
+	key := objectKeyFromPath(r.URL.Path)
 	if !strings.HasSuffix(key, "/") {
 		key += "/"
 	}
 	Logoutput("Mkcol: "+key, "debug")
-	_, err := h.Backend.PutObject(key, strings.NewReader(""))
+	_, err := h.Backend.PutObject(key, strings.NewReader(""), "")
 	if err != nil {
 		Logoutput("Unable to Put object From Mkcol Requests: "+key, "info")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -303,9 +308,9 @@ func (h *WebDAVClient) Option(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *WebDAVClient) Head(w http.ResponseWriter, r *http.Request) {
-	key := r.URL.Path
+	key := objectKeyFromPath(r.URL.Path)
 	Logoutput("Head: "+key, "debug")
-	result, err := h.Backend.GetObject(key)
+	result, actualKey, err := h.Backend.GetObjectWithFallback(key, r.URL.Path)
 	if err != nil {
 		Logoutput("Unable to Get object From Head Requests: "+key, "info")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -313,12 +318,139 @@ func (h *WebDAVClient) Head(w http.ResponseWriter, r *http.Request) {
 	}
 	defer result.Body.Close()
 
-	for k, v := range result.Metadata {
+	prefix, err := readContentPrefix(result.Body)
+	if err != nil {
+		Logoutput("Unable to read object prefix From Head Requests: "+key, "info")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	setObjectResponseHeaders(w, actualKey, result.Metadata, result.ContentType, result.ContentDisposition, result.CacheControl, result.ContentEncoding, result.ContentLanguage, result.ETag, result.LastModified, result.Expires, result.ContentLength, prefix)
+	w.WriteHeader(http.StatusOK)
+}
+
+func redirectCanonicalPath(w http.ResponseWriter, r *http.Request) bool {
+	canonicalPath := canonicalURLPath(r.URL.Path)
+	if canonicalPath == r.URL.Path {
+		return false
+	}
+	redirectURL := *r.URL
+	redirectURL.Path = canonicalPath
+	redirectURL.RawPath = ""
+	http.Redirect(w, r, redirectURL.String(), http.StatusPermanentRedirect)
+	return true
+}
+
+func canonicalURLPath(urlPath string) string {
+	if urlPath == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(urlPath, "/") {
+		urlPath = "/" + urlPath
+	}
+	for strings.Contains(urlPath, "//") {
+		urlPath = strings.ReplaceAll(urlPath, "//", "/")
+	}
+	return urlPath
+}
+
+func objectKeyFromPath(urlPath string) string {
+	return strings.TrimPrefix(canonicalURLPath(urlPath), "/")
+}
+
+func objectKeyFromDestination(destination string) string {
+	parsedURL, err := url.Parse(destination)
+	if err == nil && parsedURL.Path != "" {
+		return objectKeyFromPath(parsedURL.Path)
+	}
+	return objectKeyFromPath(destination)
+}
+
+func assetPathFromKey(key string) string {
+	return canonicalURLPath("/" + strings.TrimLeft(key, "/"))
+}
+
+func readContentPrefix(body io.Reader) ([]byte, error) {
+	if body == nil {
+		return nil, nil
+	}
+	prefix := make([]byte, 512)
+	n, err := io.ReadFull(body, prefix)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return nil, err
+	}
+	return prefix[:n], nil
+}
+
+func setObjectResponseHeaders(
+	w http.ResponseWriter,
+	key string,
+	metadata map[string]*string,
+	contentType *string,
+	contentDisposition *string,
+	cacheControl *string,
+	contentEncoding *string,
+	contentLanguage *string,
+	etag *string,
+	lastModified *time.Time,
+	expires *string,
+	contentLength *int64,
+	prefix []byte,
+) {
+	for k, v := range metadata {
+		if v == nil {
+			continue
+		}
 		Logoutput(k+" : "+*v, "debug")
 		w.Header().Set(k, *v)
 	}
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.FormatInt(*result.ContentLength, 10))
-	w.WriteHeader(http.StatusOK)
+
+	resolvedContentType := objectContentType(key, stringValue(contentType), prefix)
+	w.Header().Set("Content-Type", resolvedContentType)
+	setOptionalHeader(w, "Content-Disposition", responseContentDisposition(stringValue(contentDisposition), resolvedContentType))
+	setOptionalHeader(w, "Cache-Control", stringValue(cacheControl))
+	setOptionalHeader(w, "Content-Encoding", stringValue(contentEncoding))
+	setOptionalHeader(w, "Content-Language", stringValue(contentLanguage))
+	setOptionalHeader(w, "ETag", stringValue(etag))
+	if lastModified != nil {
+		w.Header().Set("Last-Modified", lastModified.UTC().Format(http.TimeFormat))
+	}
+	setOptionalHeader(w, "Expires", stringValue(expires))
+	if contentLength != nil {
+		w.Header().Set("Content-Length", strconv.FormatInt(*contentLength, 10))
+	}
+}
+
+func responseContentDisposition(existingDisposition, contentType string) string {
+	if !isImageContentType(contentType) {
+		return existingDisposition
+	}
+	existingDisposition = strings.TrimSpace(existingDisposition)
+	if existingDisposition == "" {
+		return "inline"
+	}
+	if _, params, err := mime.ParseMediaType(existingDisposition); err == nil {
+		if filename := params["filename"]; filename != "" {
+			return `inline; filename="` + strings.ReplaceAll(filename, `"`, `\"`) + `"`
+		}
+	}
+	parts := strings.SplitN(existingDisposition, ";", 2)
+	if len(parts) == 2 {
+		return "inline;" + parts[1]
+	}
+	return "inline"
+}
+
+func setOptionalHeader(w http.ResponseWriter, name string, value string) {
+	if strings.TrimSpace(value) == "" {
+		return
+	}
+	w.Header().Set(name, value)
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
