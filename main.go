@@ -13,12 +13,7 @@ func main() {
 		log.Println(http.ListenAndServe("localhost:6060", nil))
 	}()
 
-	var err error
-	Cfg, err = LoadConfig()
-	if err != nil {
-		Logoutput("Unable to load config", "error")
-		return
-	}
+	Cfg = LoadConfig()
 
 	Logoutput("Webdav server started", "info")
 	Logoutput("Log level: "+Cfg.Loglevel, "info")

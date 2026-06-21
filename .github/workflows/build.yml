@@ -6,7 +6,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/${{ github.repository }}
-  VERSION: v1.0.0
+  VERSION: v1.1.0
 
 jobs:
   # Test builds for non-main branches (PRs)
