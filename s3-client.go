@@ -1,36 +1,57 @@
 package main
 
 import (
-	"io"
 	"bytes"
+	"context"
+	"errors"
+	"io"
+	"mime"
+	"net/http"
+	"path/filepath"
+	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 )
 
 type S3Client struct {
-	Client *s3.S3
+	Client *s3.Client
 }
 
 func NewS3Client() *S3Client {
-	awsConfig := &aws.Config{
-		Region: aws.String(Cfg.Region),
-		Endpoint: aws.String(Cfg.Endpoint),
-		Credentials: credentials.NewStaticCredentials(Cfg.AccessKey, Cfg.SecretKey, ""),
-	}
-	awsConfig.S3ForcePathStyle = aws.Bool(true)
-
-	sess, err := session.NewSession(awsConfig)
-	if err != nil {
-		Logoutput("Unable to create S3 session", "error")
+	ctx := context.Background()
+	region, endpoint := normalizeS3Config(Cfg.Region, Cfg.Endpoint)
+	if region == "" {
+		Logoutput("S3 region is required", "error")
 		return nil
 	}
-	s3Client := s3.New(sess)
-	s3conf := "AccessKey: "+Cfg.AccessKey+"\nSecretKey: "+Cfg.SecretKey+"\nBucketName: "+Cfg.BucketName+"\nRegion: "+Cfg.Region+"\nEndpoint: "+Cfg.Endpoint
-	if _, err := s3Client.ListBuckets(nil); err != nil {
-		Logoutput("Cannot Create S3 Client, Please check the S3 configuration;\nCurrent configuration: "+s3conf, "error")
+	if !isValidS3Region(region) {
+		Logoutput("Invalid S3 region "+region+". AWS SDK Go v2 requires the region to be a valid host label. For custom S3 endpoints, use a signing region such as us-east-1 and put the service URL in endpoint.", "error")
+		return nil
+	}
+	Cfg.Region = region
+	Cfg.Endpoint = endpoint
+
+	awsConfig, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(region),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(Cfg.AccessKey, Cfg.SecretKey, "")),
+	)
+	if err != nil {
+		Logoutput("Unable to load AWS configuration", "error")
+		return nil
+	}
+	s3Client := s3.NewFromConfig(awsConfig, func(o *s3.Options) {
+		o.UsePathStyle = true
+		if Cfg.Endpoint != "" {
+			o.BaseEndpoint = aws.String(Cfg.Endpoint)
+		}
+	})
+	s3conf := "AccessKey: " + maskSecret(Cfg.AccessKey) + "\nSecretKey: " + maskSecret(Cfg.SecretKey) + "\nBucketName: " + Cfg.BucketName + "\nRegion: " + Cfg.Region + "\nEndpoint: " + Cfg.Endpoint
+	if _, err := s3Client.ListBuckets(ctx, &s3.ListBucketsInput{}); err != nil {
+		Logoutput("Cannot Create S3 Client, Please check the S3 configuration;\nCurrent configuration: "+s3conf+"\n Error:"+err.Error(), "error")
 		return nil
 	}
 	Logoutput("S3 Client created with configuration: "+s3conf, "info")
@@ -39,70 +60,261 @@ func NewS3Client() *S3Client {
 	}
 }
 
-func (s *S3Client) ListObjects(key string) (*s3.ListObjectsV2Output, error) {
-	Logoutput("ListObjects: "+key, "debug")
-	input := &s3.ListObjectsV2Input{
-		Bucket: aws.String(Cfg.BucketName),
-		Prefix: aws.String(key),
-		Delimiter: aws.String("/"),
+func normalizeS3Config(region, endpoint string) (string, string) {
+	region = trimConfigValue(region)
+	endpoint = trimConfigValue(endpoint)
+	if region == "" && endpoint != "" {
+		region = "us-east-1"
 	}
-	return s.Client.ListObjectsV2(input)
+	if endpoint != "" && !strings.Contains(endpoint, "://") {
+		endpoint = "https://" + endpoint
+	}
+	return region, endpoint
 }
 
-func (s *S3Client) GetObject(key string) (*s3.GetObjectOutput, error) {
+func trimConfigValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 {
+		quote := value[0]
+		if (quote == '"' || quote == '\'') && value[len(value)-1] == quote {
+			value = value[1 : len(value)-1]
+		}
+	}
+	return strings.TrimSpace(value)
+}
+
+func maskSecret(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if len(value) <= 8 {
+		return "****"
+	}
+	return value[:4] + "****" + value[len(value)-4:]
+}
+
+func isValidS3Region(region string) bool {
+	for _, label := range strings.Split(region, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		for _, r := range label {
+			switch {
+			case r >= '0' && r <= '9':
+			case r >= 'A' && r <= 'Z':
+			case r >= 'a' && r <= 'z':
+			case r == '-':
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (s *S3Client) ListObjects(ctx context.Context, key string) (*s3.ListObjectsV2Output, error) {
+	Logoutput("ListObjects: "+key, "debug")
+	input := &s3.ListObjectsV2Input{
+		Bucket:    aws.String(Cfg.BucketName),
+		Prefix:    aws.String(key),
+		Delimiter: aws.String("/"),
+	}
+	paginator := s3.NewListObjectsV2Paginator(s.Client, input)
+	output := &s3.ListObjectsV2Output{}
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		output.CommonPrefixes = append(output.CommonPrefixes, page.CommonPrefixes...)
+		output.Contents = append(output.Contents, page.Contents...)
+		output.Delimiter = page.Delimiter
+		output.EncodingType = page.EncodingType
+		output.Name = page.Name
+		output.Prefix = page.Prefix
+	}
+	return output, nil
+}
+
+func (s *S3Client) GetObject(ctx context.Context, key string) (*s3.GetObjectOutput, error) {
 	Logoutput("GetObject: "+key, "debug")
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(Cfg.BucketName),
-		Key: aws.String(key),
+		Key:    aws.String(key),
 	}
-	return s.Client.GetObject(input)
+	return s.Client.GetObject(ctx, input)
 }
 
-func (s *S3Client) PutObject(key string, body io.Reader) (*s3.PutObjectOutput, error) {
+func (s *S3Client) GetObjectWithFallback(ctx context.Context, key, fallbackKey string) (*s3.GetObjectOutput, string, error) {
+	result, err := s.GetObject(ctx, key)
+	if err == nil || fallbackKey == "" || fallbackKey == key || !isS3NotFound(err) {
+		return result, key, err
+	}
+
+	result, fallbackErr := s.GetObject(ctx, fallbackKey)
+	if fallbackErr != nil {
+		return nil, key, err
+	}
+	return result, fallbackKey, nil
+}
+
+func (s *S3Client) PutObject(ctx context.Context, key string, body io.Reader, providedContentType string) (*s3.PutObjectOutput, error) {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		Logoutput("Unable to read Body for Put Requests", "info")
 		return nil, err
 	}
 	Logoutput("PutObject: "+key, "debug")
+	contentType := objectContentType(key, providedContentType, data)
 	input := &s3.PutObjectInput{
-		Bucket: aws.String(Cfg.BucketName),
-		Key:    aws.String(key),
-		Body:   bytes.NewReader(data),
+		Bucket:      aws.String(Cfg.BucketName),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(data),
+		ContentType: aws.String(contentType),
 	}
-	return s.Client.PutObject(input)
+	if isImageContentType(contentType) {
+		input.ContentDisposition = aws.String("inline")
+	}
+	return s.Client.PutObject(ctx, input)
 }
 
-func (s *S3Client) DeleteObject(key string) (*s3.DeleteObjectOutput, error) {
+func (s *S3Client) DeleteObject(ctx context.Context, key string) (*s3.DeleteObjectOutput, error) {
 	Logoutput("DeleteObject: "+key, "debug")
 	input := &s3.DeleteObjectInput{
 		Bucket: aws.String(Cfg.BucketName),
-		Key: aws.String(key),
+		Key:    aws.String(key),
 	}
-	return s.Client.DeleteObject(input)
+	return s.Client.DeleteObject(ctx, input)
 }
 
-func (s *S3Client) CopyObject(src, dest string) (*s3.CopyObjectOutput, error) {
+func (s *S3Client) CopyObject(ctx context.Context, src, dest string) (*s3.CopyObjectOutput, error) {
 	Logoutput("CopyObject: "+src+" to "+dest, "debug")
 	input := &s3.CopyObjectInput{
-		Bucket: aws.String(Cfg.BucketName),
+		Bucket:     aws.String(Cfg.BucketName),
 		CopySource: aws.String(Cfg.BucketName + "/" + src),
-		Key: aws.String(dest),
+		Key:        aws.String(dest),
 	}
-	return s.Client.CopyObject(input)
+	return s.Client.CopyObject(ctx, input)
 }
 
-func (s *S3Client) MoveObject(src, dest string) (*s3.CopyObjectOutput, error) {
+func (s *S3Client) MoveObject(ctx context.Context, src, dest string) (*s3.CopyObjectOutput, error) {
 	Logoutput("MoveObject: "+src+" to "+dest, "debug")
-	_, err := s.CopyObject(src, dest)
+	result, err := s.CopyObject(ctx, src, dest)
 	if err != nil {
 		Logoutput("Unable to copy object From Move Requsts", "info")
 		return nil, err
 	}
-	_, err = s.DeleteObject(src)
+	_, err = s.DeleteObject(ctx, src)
 	if err != nil {
 		Logoutput("Unable to delete object From Move Requets", "info")
 		return nil, err
 	}
-	return nil, nil
+	return result, nil
+}
+
+func isS3NotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NoSuchKey", "NotFound":
+			return true
+		}
+	}
+	return false
+}
+
+func objectContentType(key, providedContentType string, data []byte) string {
+	if !isGenericContentType(providedContentType) {
+		return providedContentType
+	}
+	return inferContentType(key, data)
+}
+
+func inferContentType(key string, data []byte) string {
+	extensionType := contentTypeByExtension(key)
+	if len(data) > 0 {
+		sniffedType := http.DetectContentType(data)
+		if !isGenericContentType(sniffedType) {
+			if isSVGContentType(extensionType) && isXMLLikeContentType(sniffedType) {
+				return extensionType
+			}
+			return sniffedType
+		}
+	}
+	if extensionType != "" {
+		return extensionType
+	}
+	return "application/octet-stream"
+}
+
+func contentTypeByExtension(key string) string {
+	extension := strings.ToLower(filepath.Ext(key))
+	if extension == "" {
+		return ""
+	}
+	if contentType := mime.TypeByExtension(extension); contentType != "" {
+		return contentType
+	}
+	switch extension {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".svg":
+		return "image/svg+xml"
+	case ".avif":
+		return "image/avif"
+	case ".bmp":
+		return "image/bmp"
+	case ".ico":
+		return "image/x-icon"
+	case ".tif", ".tiff":
+		return "image/tiff"
+	case ".heic":
+		return "image/heic"
+	case ".heif":
+		return "image/heif"
+	default:
+		return ""
+	}
+}
+
+func isGenericContentType(contentType string) bool {
+	mediaType := strings.TrimSpace(strings.ToLower(contentType))
+	if parsedType, _, err := mime.ParseMediaType(mediaType); err == nil {
+		mediaType = parsedType
+	}
+	return mediaType == "" || mediaType == "application/octet-stream" || mediaType == "binary/octet-stream"
+}
+
+func isImageContentType(contentType string) bool {
+	mediaType := strings.TrimSpace(strings.ToLower(contentType))
+	if parsedType, _, err := mime.ParseMediaType(mediaType); err == nil {
+		mediaType = parsedType
+	}
+	return strings.HasPrefix(mediaType, "image/")
+}
+
+func isSVGContentType(contentType string) bool {
+	mediaType := strings.TrimSpace(strings.ToLower(contentType))
+	if parsedType, _, err := mime.ParseMediaType(mediaType); err == nil {
+		mediaType = parsedType
+	}
+	return mediaType == "image/svg+xml"
+}
+
+func isXMLLikeContentType(contentType string) bool {
+	mediaType := strings.TrimSpace(strings.ToLower(contentType))
+	if parsedType, _, err := mime.ParseMediaType(mediaType); err == nil {
+		mediaType = parsedType
+	}
+	return mediaType == "text/xml" || mediaType == "application/xml" || mediaType == "text/plain"
 }
